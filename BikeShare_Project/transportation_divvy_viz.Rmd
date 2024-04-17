@@ -1,0 +1,385 @@
+---
+title: "Practice Script for Transportation Exercise"
+author: "C. Bae"
+date: "October 2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Context for Lab Exercise
+
+### Background and Related Sources
+
+There are various aspects of transportation data analysis that can help us understand patterns of daily mobility in urban contexts. We can look at factors around station coverage, accessibility to stations, and regular movement behavior based on public open data provided by micro-mobility and other shared mobility operators (such as bikeshare systems). Another useful source of information is the [Chicago Transportation Network Providers](https://www.chicago.gov/city/en/depts/bacp/provdrs/vehic/svcs/tnp.html) data, which has information on the usage of ride-hailing services such as Lyft and Uber.
+
+Another good resource for spatial analysis in the transportation context is [Chapter 13: Transportation](https://geocompr.robinlovelace.net/transport.html) from Lovelace's *Geocomputation with R* (2023), which explores in-depth a transportation case study of Bristol to ask how to increase cycling within the city. As stated in that chapter, you may want to explore these aspects of transportation research:
+
+- Describe the geographical patterns of transport behavior in cities
+- Identify key public transport nodes supporting multi-mode trips
+- Analyze travel ‘desire lines’ to find where many people drive short distances
+- Identify cycle route locations that will encourage less car driving and more cycling
+
+### Divvy Bikeshare System Data
+
+For our exercise today and this week's assignment, we'll use open data from Chicago's bikeshare system, Divvy. 
+
+Data source: [Divvy Data](https://divvybikes.com/system-data)
+
+Metadata: 
+
+>Each trip is anonymized and includes:
+>
+>- Trip start day and time
+>- Trip end day and time
+>- Trip start station
+>- Trip end station
+>- Rider type (Member, Single Ride, and Day Pass)
+>
+>The data has been processed to remove trips that are taken by staff as they service and inspect the system; and any trips that were below 60 seconds in length (potentially false starts or users trying to re-dock a bike to ensure it was secure).
+
+Although here we work only with trips data source, you are welcome to additionally use the [Divvy station data](https://data.cityofchicago.org/Transportation/Divvy-Bicycle-Stations-In-Service/67g3-8ig8) (last updated September 2022) from the Chicago Open Data Portal or more updated data from the JSON-feed (API), [Chicago bike routes](https://data.cityofchicago.org/Transportation/Bike-Routes/3w5d-sru8) spatial data, and/or other sources you locate. 
+
+
+## Set-up
+
+### Load libraries
+
+```{r load-libraries, message = FALSE, warning = FALSE}
+library(tidyverse)  # dplyr, tidyr
+library(sf)         # for R spatial data format
+library(tmap)       # for spatial visualization
+
+# New libraries since last
+library(stplanr)    # for processing geographic transport data
+
+# Additional optional packages
+#library(osmdata)
+#library(sfnetworks) # spatial network classes and functions
+```
+
+### Import Divvy data from Chicago Open Data Portal
+
+Specifically, we use data downloaded as a CSV for one month of trips taken using the Divvy bikeshare system for the month of June 2023.
+
+```{r read-divvy-data, message = FALSE}
+divvy_data <- read.csv("data/202306-divvy-tripdata.csv")
+
+# inspect dimensions and structure
+dim(divvy_data)
+str(divvy_data)
+head(divvy_data)
+
+# replace blanks with NA (null) values
+divvy_data <- divvy_data %>% mutate_if(is.character, ~na_if(., ''))
+```
+
+### Create spatial objects for Origin and Destination bikeshare stations
+
+First, we'll create a dataframe representing the origin stations of interest, which we can convert to spatial format. Originally I did this rather than joining to another dataset of bikeshare stations because the latitude and longitude coordinates are already given within this dataset. 
+
+Also note that we have some rides that begin and/or end outside of a docked station (those whose start_station and/or end_station are missing). For those, a general location is also given, which you can see by the longitude and latitude decimal degrees rounded up to two decimal places - this represents an accuracy of up to about 1km. See this [GIS wiki article](http://wiki.gis.com/wiki/index.php/Decimal_degrees) for more context. In this exercise we choose to drop those using the `drop_na()` function.
+
+```{r o-stations, message = FALSE}
+# Keep only one instance of each origin station to create point dataset of stations (note minor noise in lat/long)
+o_stations <- divvy_data %>% 
+  drop_na(start_station_id) %>% # remove rows where start_station_id has null values
+  distinct(start_station_id, .keep_all = TRUE)
+
+# Drop columns that aren't relevant (because they pertain to individual rides)
+colnames(o_stations)
+o_stations <- o_stations %>% 
+  subset(select=c("start_station_name", "start_station_id", "start_lat", "start_lng"))
+
+# Convert to spatial using start_lat, start_long
+o_spatial <- o_stations %>% 
+  st_as_sf(coords=c("start_lng", "start_lat"), crs = 4326) # x = longitude, y = latitude
+
+# Plot these locations as points to visually check for outliers or potential issues
+tm_shape(o_spatial) + tm_dots()
+```
+
+Repeat the above for destination stations. Remember in this case we drop start station information and only retain end station information.
+
+```{r d-stations, message = FALSE}
+d_stations <- divvy_data %>% 
+  drop_na(end_station_id) %>%
+  distinct(end_station_id, .keep_all = TRUE)
+
+d_spatial <- d_stations %>% 
+  subset(select=c("end_station_name", "end_station_id", "end_lat", "end_lng")) %>% 
+  st_as_sf(coords=c("end_lng","end_lat"), crs = 4326)
+```
+
+*Note*: We will see later in the exercise that we need to transform the CRS of the Divvy data for use with our projected Community Areas boundary shapefiles. For an in-depth resource on Coordinate Reference Systems (CRS), see this section from Lovelace's *Geocomputation with R*: https://bookdown.org/robinlovelace/geocompr/reproj-geo-data.html
+
+
+## Subset rides data
+
+You may need to work with a subset of your original dataset, such as in the case of very large data, and generally because not all observations or variables will be of interest to your question. Our original Divvy rides dataset is reasonably large at `r nrow(divvy_data)` rows by `r ncol(divvy_data)` columns, but should be manageable in R.
+
+```{r subsetting-options}
+# Create subset of a random sample of 500 rows
+subset1 <- slice_sample(divvy_data, n = 500)
+
+# Use unique() to see what values exist for a certain categorical column
+unique(divvy_data$rideable_type)
+
+# Subset based on condition using filter()
+#subset2 <- filter(divvy_data, rideable_type == "electric_bike")
+subset2 <- divvy_data %>% filter(rideable_type == "electric_bike")
+```
+
+### Example question: Where do most riders go from the Divvy station at Cornell Ave & Hyde Park Blvd?
+
+First, we will subset just those rides starting from Cornell Ave & Hyde Park Blvd based on `start_station_id`.
+
+*Note*: You can search in RStudio 'View' to identify the relevant station ID.
+
+```{r example-from-origin}
+subset3 <- divvy_data %>% filter(start_station_id == "KA1503000007") 
+
+# Make table of destinations, arranged in order from highest number of riders
+hp_stop <- subset3 %>% 
+  group_by(end_station_name) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count))
+
+head(hp_stop)
+
+# Join to spatial destination object
+joined_hp_stop <- merge(d_spatial, hp_stop)
+```
+
+You should now see that the new object has both spatial location and counts.
+
+Let's plot those destination stations alongside ('on top of') our origin station.
+
+```{r plot-example-from-origin, message = FALSE}
+tm_shape(o_spatial) + tm_dots() +
+  tm_shape(joined_hp_stop) + tm_bubbles(size = "count")
+
+# Explore in interactive map
+tmap_mode("view")
+
+# View in static map
+#tmap_mode("plot")
+
+# Or just switch modes
+ttm()
+```
+
+
+## Zonal Summaries
+
+You may be interested in more than one 'origin' or 'destination' Divvy station, however. Let's next summarize our monthly data based on travel zones. In this case, our Chicago Community Areas will serve as a nice areal unit for our analysis.
+
+### Example question: What are the most common trips (or destination zones) that originate from Hyde Park Divvy stations?
+
+Workflow idea:
+
+- Identify which stations are located within the Hyde Park Community Area
+- Subset data based on those stations only
+- Plot flows based on volume
+
+This one is very similar to O-D analyses we did in last week's exercise.
+
+### Read in Community Areas shapefile
+
+```{r read-comm-areas, message = FALSE}
+CAs <- st_read("data\\CommAreas.shp") # make sure data is unzipped; unlike QGIS, sf doesn't recognize .zip files
+
+# Look at the Community Area boundaries
+#tm_shape(CAs) + tm_polygons()
+```
+
+### Select the Hyde Park Community Area
+
+We can use the origin points object we've already created above, which is named `o_spatial` and is an sf object.
+
+```{r select-hp-origins, message = FALSE}
+# Look at the Community Area boundaries and the origin stations
+tm_shape(CAs) + tm_polygons() +
+  tm_shape(o_spatial) + tm_dots()
+```
+
+To select just the origin stations that are located in Hyde Park, we use a point-in-polygon operation. We first join the two datasets using the `st_join()` function. We want to find the stations that are within the Community Areas, so specify the datasets in that order and use `st_within` as the method of join. 
+
+This will output a new sf object which has the original rows for each listing appended with the Community Area information. The output will have the same number of rows as the original point dataset.
+
+```{r pip, message = FALSE}
+#pip_stations <- st_join(o_spatial, CAs, join = st_within)
+
+# The above line doesn't work because CRS are not equal
+#st_crs(o_spatial)
+#st_crs(CAs)
+
+# Transform CRS from points to match Community Areas
+o_spatial <- st_transform(o_spatial, 3435)
+
+# Try again
+pip_stations <- st_join(o_spatial, CAs, join = st_within)
+head(pip_stations)
+```
+
+Now, each station has the associated Community Area information joined to it.
+We can count how many stations are within each Community Area, then join that back to the Community Areas object so we can plot it on the map.
+
+```{r count-pip}
+stations_per_CA <- count(as_tibble(pip_stations), COMMUNITY) %>%
+  print(head(10))
+
+CAs_with_stations <- left_join(CAs, stations_per_CA)
+
+# Plot Community Areas, creating a choropleth based on origins_per_CA counts
+tm_shape(CAs_with_stations) + tm_polygons("n", style = "jenks", palette = "Purples", legend.hist = TRUE) +
+  tm_layout(main.title = "Divvy Stations per Community Area")
+```
+
+But let's take a step back and select just the stations in Hyde Park based on the `COMMUNITY` variable.
+
+```{r select-pip-hp}
+hp_stations <- pip_stations %>% 
+  filter(COMMUNITY == "HYDE PARK")
+
+# uncomment if you want to check:
+ # tm_shape(CAs) + tm_polygons() +
+ #   tm_shape(hp_stations) + tm_dots()
+```
+
+### Subset trips that originate in Hyde Park
+
+We can then subset our trips data based on the IDs of the Hyde Park stations.
+
+```{r subset-hp-origin-trips}
+hp_starts <- divvy_data %>%
+      filter(start_station_id %in% hp_stations$start_station_id)
+```
+
+Note that by subsetting our trips data based on those that began in the Hyde Park Divvy stations, we are ignoring any potential trips that began in Hyde Park outside of a docked station (such as in the case of dockless bikes).
+
+For zonal summaries we will want to return to exploring the familiar concept of origin-destination flows.
+
+### Origin-destination flows (now in R!)
+
+Likely you'll subset your trips data before this; the example given below is if we want to consider only those trips originating from a Hyde Park (docked) Divvy station.
+
+Based on station names we can look at overall flow of trips going from Hyde Park Community Area stations to stations in other Community Areas.
+
+```{r od-formatting}
+# drop_na for end_stations_name
+hp_starts <- hp_starts %>% 
+  drop_na(end_station_id)
+
+hp_trip_summary <- hp_starts %>%  
+  group_by(start_station_name, end_station_name) %>% 
+  summarise(flow = n())
+
+# this function is from stplanr package
+#flows_from_hp <- od2line(flow = hp_trip_summary, zones = o_spatial)
+
+# above doesn't work, so manually drop rows
+hp_trip_summary <- hp_trip_summary[-c(356, 518, 524, 651, 815), ]
+
+str(hp_trip_summary)
+# then try again
+flows_from_hp <- od2line(flow = hp_trip_summary, zones = o_spatial)
+```
+
+...this method of manually dropping rows is dangerous, but package doesn't seem to have built-in option for identifying offending rows, as far as I can tell. You can alternatively remove stations by name in the `end_station_name` column.
+
+Removed stations:
+
+- Row 356: Public Rack - Saginaw Ave & 93rd St
+- Row 518: Western Blvd & 48th Pl
+- Row 524: Buckingham Fountain
+- Row 651: Buckingham Fountain
+- Row 815: Buckingham Fountain
+
+```{r plot-flows}
+tm_shape(CAs) + tm_polygons() +
+  tm_shape(flows_from_hp) + tm_lines(col = "darkred", alpha = 0.2)
+  # tm_shape(flows_from_hp) + tm_lines(col = "flow", palette = "Reds")
+```
+
+This flow map is difficult to interpret for a number of reasons. Can you improve upon this?
+
+
+## Appendix: Bonus Additional Ideas
+
+### Street Network Data Acquisition from OpenStreetMap (OSM)
+
+Another idea is to consider the underlying street network, either for comparing structures of the road and cycling path network or for inferring commonly used routes between sets of origins and destinations. 
+
+We can first use a boundary of all of Chicago, downloaded through the **osmdata** package using a bounding box command `getbb` which can return a bounding box or a polygon boundary. This returned result may not match the 'official' boundary. It only needs to be good enough to spatially select the area (really just a bounding box containing the area) for which we want to download features.
+
+```{r osm-bb, echo = FALSE, message = FALSE, warning = FALSE}
+#install.packages("osmdata")
+
+library(osmdata)
+
+chi <- osmdata::getbb("Chicago", format_out = "sf_polygon", limit = 1)
+
+tm_shape(chi) + tm_polygons()
+```
+
+We are interested in OSM features with the high-level key "highway". See the [OpenStreetMap wiki entry](https://wiki.openstreetmap.org/wiki/Key:highway) for more detail. We will first see what tags are available for the "highway" key.
+
+```{r osm-tags, message = FALSE}
+highway_tags <- available_tags("highway") # you can try other tags as well, such as "amenity"
+```
+
+Hint: Use "Query Features" in the OSM web interface to see what tags are used for the kind of features you're interested in.
+
+Let's extract some features now.
+
+```{r extract-cyclepaths, message = FALSE}
+cyclepaths <- getbb("Chicago") %>%
+  opq() %>%
+  add_osm_feature(key = "highway", 
+                  value = c("cycleway")) %>%
+  osmdata_sf() # in sf (spatial) format
+
+bikeroutes <- getbb("Chicago") %>%
+  opq() %>%
+  add_osm_feature(key = "route", 
+                  value = c("bicycle")) %>% # you can add multiple tags if desired
+  osmdata_sf()
+```
+
+Other potential tags of interest may be "footpath", "secondary", "tertiary", "residential", etc.
+
+Our new object resulting from `add_osm_feature` is a collection of dataframes which can be viewed or mapped easily.
+
+```{r path-lines, message = FALSE}
+# uncomment to look at how the data is organized
+#head(cyclepaths[["osm_lines"]])
+
+tm_shape(CAs) + tm_fill() +
+  tm_shape(cyclepaths$osm_lines) + tm_lines(col = "darkred") +
+  tm_shape(bikeroutes$osm_lines) + tm_lines()
+```
+
+As you can see, you would want to compare this volunteer-contributed data and the selected tags for quality before using it as part of your analysis.
+
+You can further explore the documentation and other guides to the osmdata package to plan out a sample workflow for acquiring geographic data related to transportation (such as street networks, transit lines, etc). Which features are relevant to the question(s) you are asking?
+
+### Shortest Path Routing from OSRM
+
+#### Example question: What are key segments of the Chicago road network that can help improve connectivity for cyclists? How much does the current bicycle infrastructure support movement along the shortest routes for popular flows?
+
+Workflow idea:
+
+- Consider existing high-volume O-D segments (paired locations)
+- Calculate shortest distance routes using city road network, making choices such as removing highways in that consideration
+- For some cases, you may want to remove existing cycle infrastructure from your assessment, so we can consider only places of possible future improvement
+
+From McKenzie & Romm reading:
+
+> "...trip distance was calculated along a city's road network. The shortest path route between the origin and destination for each proposed trip were computed using the Open Source Routing Machine (http://project-osrm.org/) with routing set to shortest distance along the OpenStreetMap road network (including foot paths)."
+
+For those interested in routing along street networks, see additional worked examples in the Lovelace [Section 13.6 Routes](https://r.geocompx.org/transport.html#routes) reading. There is discussion of different routing engines you can use, including the OSRM mentioned in the McKenzie & Romm reading. However, note that this is a more advanced process so it is just included here in case of interest.
+
+---
